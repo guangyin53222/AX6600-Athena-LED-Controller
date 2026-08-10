@@ -1,0 +1,91 @@
+name: Build athena-led (standalone)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'OpenWrt SDK version (snapshots / 24.10.1 / 23.05.4)'
+        required: false
+        default: 'snapshots'
+      target:
+        description: 'SDK target'
+        required: false
+        default: 'qualcommax/ipq60xx'
+      pkg_branch:
+        description: 'athena-led repo branch'
+        required: false
+        default: 'main'
+
+env:
+  PKG_REPO: https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Build with OpenWrt SDK
+      uses: openwrt/gh-action-sdk@main
+      env:
+        ARCH: aarch64_cortex-a53-${{ github.event.inputs.version }}
+        TARGET: ${{ github.event.inputs.target }}
+        VERSION: ${{ github.event.inputs.version }}
+        FEEDNAME: athena_ci
+        PACKAGES: athena-led luci-app-athena-led
+        NO_REFRESH_CHECK: 1
+        # 把插件源挂成 extra feed，并修掉 2.5.0 404
+        EXTRA_FEEDS: >
+          src-git athena_ci ${{ env.PKG_REPO }}^${{ github.event.inputs.pkg_branch }}
+
+    # gh-action-sdk 默认不会自动修 Makefile 版本号，这里兜底处理
+    - name: Patch athena-led Makefile to 2.4.0
+      run: |
+        find . -path '*athena-led*/Makefile' | while read f; do
+          echo ">> patch $f"
+          sed -i \
+            -e 's/PKG_VERSION:=.*/PKG_VERSION:=2.4.0/' \
+            -e 's/PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz/PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v2.4.0.tar.gz/' \
+            -e 's#PKG_SOURCE_URL:=.*v2.5.0/#PKG_SOURCE_URL:=https://github.com/unraveloop/JDC-AX6600-Athena-LED-Controller/releases/download/v2.4.0/#' \
+            -e '/PKG_HASH:=/d' \
+            -e '/^PKG_MAINTAINER/a PKG_HASH:=skip' \
+            "$f"
+        done
+
+    - name: Rebuild after patch
+      uses: openwrt/gh-action-sdk@main
+      env:
+        ARCH: aarch64_cortex-a53-${{ github.event.inputs.version }}
+        TARGET: ${{ github.event.inputs.target }}
+        VERSION: ${{ github.event.inputs.version }}
+        FEEDNAME: athena_ci
+        PACKAGES: athena-led luci-app-athena-led
+        NO_REFRESH_CHECK: 1
+        EXTRA_FEEDS: >
+          src-git athena_ci ${{ env.PKG_REPO }}^${{ github.event.inputs.pkg_branch }}
+
+    - name: Upload ipk as Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: athena-led-ipk-aarch64_cortex-a53
+        path: |
+          bin/packages/aarch64_cortex-a53/athena_ci/*.ipk
+          bin/packages/aarch64_cortex-a53/base/athena-led*.ipk
+          bin/packages/aarch64_cortex-a53/base/luci-app-athena-led*.ipk
+          bin/packages/aarch64_cortex-a53/base/luci-i18n-athena-led-zh-cn*.ipk
+        if-no-files-found: error
+
+    - name: Generate release tag
+      id: tag
+      run: echo "tag=$(date +'%Y.%m.%d-%H%M')-athena-led" >> $GITHUB_OUTPUT
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        files: |
+          bin/packages/aarch64_cortex-a53/athena_ci/*.ipk
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
