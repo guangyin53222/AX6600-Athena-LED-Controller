@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. 读取版本号 (拆包后仓库里有两个 Makefile，固定从 athena-led/Makefile 读)
+      # 1. 读取版本号 (从 athena-led/Makefile 读，这是 OpenWrt 打包用的 Makefile)
       - name: Get Version
         id: version
         run: |
@@ -44,23 +44,32 @@ jobs:
           pip3 install cargo-zigbuild ziglang
 
       # 4. 编译 Rust
+      #    注意：athena-led/ 下有 Makefile (OpenWrt打包) 和 Cargo.toml (Rust项目)
+      #    如果存在 Cargo.toml 就直接编译，否则在 athena-led/ 下找
       - name: Compile Rust
-        working-directory: ./athena-led
         run: |
           set -e
-          cargo zigbuild --release --target aarch64-unknown-linux-musl
+          if [ -f "athena-led/Cargo.toml" ]; then
+            cd athena-led
+            cargo zigbuild --release --target aarch64-unknown-linux-musl
+          else
+            echo "❌ No Cargo.toml found in athena-led/"
+            echo "--- athena-led/ contents ---"
+            ls -la athena-led/
+            exit 1
+          fi
 
-      # 5. 打包二进制 (强制使用长文件名)
+      # 5. 打包二进制 (Makefile 要求长文件名格式)
       - name: Package Binary
         id: package
-        working-directory: ./athena-led
         run: |
           set -e
           VERSION="${{ steps.version.outputs.VERSION }}"
 
-          # ⚠️ 强制指定为 Makefile 要求的长文件名格式 (带架构名)
+          # Makefile 要求的文件名: athena-led-aarch64-unknown-linux-musl-v{VERSION}.tar.gz
           FILENAME="athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz"
 
+          cd athena-led
           mkdir -p dist
           cp target/aarch64-unknown-linux-musl/release/athena-led dist/
 
@@ -128,7 +137,18 @@ jobs:
 
           BASE_URL="${{ matrix.sdk_url }}"
           echo ">> Fetching SDK from $BASE_URL"
-          wget -q "$BASE_URL/sha256sums" -O sha256sums
+
+          # 重试下载 sha256sums
+          for i in 1 2 3; do
+            wget -q "$BASE_URL/sha256sums" -O sha256sums && break
+            echo "⚠️ Failed to download sha256sums (attempt $i), retrying..."
+            sleep 10
+          done
+
+          if [ ! -f "sha256sums" ] || [ ! -s "sha256sums" ]; then
+            echo "❌ Cannot download sha256sums from $BASE_URL"
+            exit 1
+          fi
 
           SDK_FILE=$(grep "sdk" sha256sums | grep "Linux-x86_64" | head -n 1 | awk '{print $2}' | sed 's/*//g')
           if [ -z "$SDK_FILE" ]; then
@@ -138,7 +158,17 @@ jobs:
           fi
           echo ">> SDK file: $SDK_FILE"
 
-          wget -q "$BASE_URL/$SDK_FILE" -O "sdk_archive"
+          # 重试下载 SDK
+          for i in 1 2 3; do
+            wget -q "$BASE_URL/$SDK_FILE" -O "sdk_archive" && break
+            echo "⚠️ Failed to download SDK (attempt $i), retrying..."
+            sleep 15
+          done
+
+          if [ ! -f "sdk_archive" ] || [ ! -s "sdk_archive" ]; then
+            echo "❌ Cannot download SDK archive"
+            exit 1
+          fi
 
           if [[ "$SDK_FILE" == *.zst ]]; then
             zstd -d "sdk_archive" -o sdk.tar
@@ -161,45 +191,143 @@ jobs:
           set -e
           mkdir -p sdk/dl
           cp local_dl/*.tar.gz sdk/dl/
+          echo ">> Injected tarballs into sdk/dl/:"
+          ls -la sdk/dl/
 
-      - name: Configure Feeds
+      - name: Configure Feeds (with retry)
         working-directory: ./sdk
         run: |
           set -e
+          # 全部改用 GitHub 镜像（避免 git.openwrt.org 不可达）
           sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf.default
           sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' feeds.conf.default
           sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' feeds.conf.default
-          ./scripts/feeds update -a
+
+          # feeds update 加重试
+          for i in 1 2 3; do
+            echo ">> feeds update attempt $i..."
+            ./scripts/feeds update -a && break
+            echo "⚠️ feeds update failed, retrying in 15s..."
+            sleep 15
+          done
+
           ./scripts/feeds install -a
 
-      - name: Compile Packages
+      - name: Install Package Sources (athena-led + luci-app-athena-led)
         working-directory: ./sdk
         run: |
           set -e
           sudo apt-get install -y dos2unix
 
-          # 1. athena-led 核心包
+          # ============================================================
+          # 1. athena-led 核心包（Rust 二进制 + init + config + 动画）
+          # ============================================================
           mkdir -p package/athena-led
           cp "$GITHUB_WORKSPACE/athena-led/Makefile" package/athena-led/
-          cp -r "$GITHUB_WORKSPACE/athena-led/files" package/athena-led/
+          mkdir -p package/athena-led/files
+          cp -r "$GITHUB_WORKSPACE/athena-led/files/." package/athena-led/files/
+          echo "✅ athena-led package prepared"
 
-          # 2. luci-app 界面包
+          # ============================================================
+          # 2. luci-app-athena-led Web 界面包（关键！之前漏掉的根因）
+          # ============================================================
           mkdir -p package/luci-app-athena-led
-          cp -r "$GITHUB_WORKSPACE/luci-app-athena-led"/* package/luci-app-athena-led/
+          cp "$GITHUB_WORKSPACE/luci-app-athena-led/Makefile" package/luci-app-athena-led/
 
+          # 复制 htdocs/ (JS 视图)
+          if [ -d "$GITHUB_WORKSPACE/luci-app-athena-led/htdocs" ]; then
+            mkdir -p package/luci-app-athena-led/htdocs
+            cp -r "$GITHUB_WORKSPACE/luci-app-athena-led/htdocs/." package/luci-app-athena-led/htdocs/
+            echo "✅ htdocs/ copied"
+          fi
+
+          # 复制 luasrc/ (Lua controller/CBI，向后兼容)
+          if [ -d "$GITHUB_WORKSPACE/luci-app-athena-led/luasrc" ]; then
+            mkdir -p package/luci-app-athena-led/luasrc
+            cp -r "$GITHUB_WORKSPACE/luci-app-athena-led/luasrc/." package/luci-app-athena-led/luasrc/
+            echo "✅ luasrc/ copied"
+          fi
+
+          # 复制 po/ (翻译文件)
+          if [ -d "$GITHUB_WORKSPACE/luci-app-athena-led/po" ]; then
+            mkdir -p package/luci-app-athena-led/po
+            cp -r "$GITHUB_WORKSPACE/luci-app-athena-led/po/." package/luci-app-athena-led/po/
+            echo "✅ po/ copied"
+          fi
+
+          # 复制 root/ (menu.d / acl.d / rpcd 权限)
+          if [ -d "$GITHUB_WORKSPACE/luci-app-athena-led/root" ]; then
+            mkdir -p package/luci-app-athena-led/root
+            cp -r "$GITHUB_WORKSPACE/luci-app-athena-led/root/." package/luci-app-athena-led/root/
+            echo "✅ root/ copied"
+          fi
+
+          echo "✅ luci-app-athena-led package fully prepared"
+          echo "--- package/luci-app-athena-led/ tree ---"
+          find package/luci-app-athena-led -type f | head -40
+
+          # ============================================================
           # 3. 强制转为 Linux 换行符 (排除二进制动画文件)
-          find package/athena-led package/luci-app-athena-led -type f ! -name "*.bin" -exec dos2unix {} +
+          # ============================================================
+          find package/athena-led package/luci-app-athena-led -type f \
+            ! -name "*.bin" ! -name "*.lmo" -exec dos2unix {} + 2>/dev/null || true
 
-          # 4. 移除会导致找不到密钥而崩溃的 CONFIG_SIGNED_PACKAGES
-          echo "CONFIG_PACKAGE_athena-led=m" > .config
-          echo "CONFIG_PACKAGE_luci-app-athena-led=m" >> .config
+      - name: Configure Build (.config)
+        working-directory: ./sdk
+        run: |
+          set -e
+          # 用 feeds install 注册包，然后生成默认 config
+          ./scripts/feeds install -a 2>/dev/null || true
 
+          # 创建 .config 并启用两个包
+          cat > .config <<EOF
+          CONFIG_PACKAGE_athena-led=y
+          CONFIG_PACKAGE_luci-app-athena-led=y
+          EOF
+
+          # 让 SDK 自动补全依赖
           make defconfig
-          make package/athena-led/download V=s
+
+          echo "--- .config (athena entries) ---"
+          grep -i athena .config || echo "(no athena entries found!)"
+
+      - name: Compile athena-led
+        working-directory: ./sdk
+        run: |
+          set -e
+          echo ">> Downloading prebuilt binary tarball..."
+          make package/athena-led/download V=s || true
+          echo ">> Compiling athena-led..."
           make package/athena-led/compile V=s -j$(nproc)
+
+      - name: Compile luci-app-athena-led
+        working-directory: ./sdk
+        run: |
+          set -e
+          echo ">> Compiling luci-app-athena-led..."
           make package/luci-app-athena-led/compile V=s -j$(nproc)
 
-      # 生成安装包校验和
+      # 确认产物
+      - name: Verify Build Output
+        run: |
+          set -e
+          echo "=== Searching for built packages ==="
+          find sdk/bin -name "*athena-led*" -type f 2>/dev/null | tee found_packages.txt
+          echo ""
+          echo "--- Package count ---"
+          wc -l found_packages.txt
+          echo ""
+          echo "--- Verify luci-app is included ---"
+          if grep -q "luci-app-athena-led" found_packages.txt; then
+            echo "✅ luci-app-athena-led was built successfully!"
+          else
+            echo "❌ luci-app-athena-led NOT FOUND in build output!"
+            echo "--- Checking if it was even configured ---"
+            grep "luci-app-athena-led" sdk/.config || echo "Not in .config either"
+            exit 1
+          fi
+
+      # 生成校验和
       - name: Generate checksums
         run: |
           set -e
@@ -210,7 +338,18 @@ jobs:
           done | sort -u > sha256sums-${{ matrix.type }}.txt
           cat sha256sums-${{ matrix.type }}.txt
 
-      # 仅 release 事件上传
+      # 上传产物到 workflow artifacts (调试用)
+      - name: Upload Build Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-packages-${{ matrix.type }}
+          path: |
+            sdk/bin/**/*athena-led*.${{ matrix.type }}
+            sdk/bin/sha256sums-${{ matrix.type }}.txt
+          retention-days: 7
+
+      # 仅 release 事件上传到 Release
       - name: Upload Packages to Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
