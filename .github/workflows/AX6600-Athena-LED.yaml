@@ -4,102 +4,94 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'OpenWrt SDK version suffix (SNAPSHOT / 24.10 / 23.05.4 / openwrt-25.12)'
+        description: "OpenWrt SDK version"
         required: false
-        default: 'SNAPSHOT'
-      target:
-        description: 'SDK target (only used for feed selection)'
-        required: false
-        default: 'qualcommax/ipq60xx'
-      pkg_branch:
-        description: 'athena-led repo branch'
-        required: false
-        default: 'main'
-
-env:
-  PKG_REPO: https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git
+        default: "openwrt-25.12"
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
+    env:
+      SDK_TAG: mediatek-filogic-${{ inputs.version }}
+      ARCH: aarch64_cortex-a53
+      WORK_DIR: /home/runner/work/AX6600-Athena-LED-Controller/AX6600-Athena-LED-Controller
+
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      # 把用户输入统一成 OpenWrt 官方 SDK 镜像的真实 tag 后缀
-      # 规则：SNAPSHOT / main / master / openwrt-X.Y / vX.Y.Z
-      # 参考：https://github.com/openwrt/docker (ghcr.io/openwrt/sdk)
-      - name: Normalize SDK version tag
-        id: sdkver
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull OpenWrt SDK (stable)
         run: |
-          RAW="${{ github.event.inputs.version }}"
-          # 兼容旧输入：snapshots / Snapshot -> SNAPSHOT
-          case "$RAW" in
-            snapshots|Snapshot|snapshot) TAG="SNAPSHOT" ;;
-            *)                       TAG="$RAW" ;;
-          esac
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Using SDK tag suffix: $TAG"
+          docker pull ghcr.io/openwrt/sdk:${{ env.ARCH }}-${{ inputs.version }}
 
-      - name: Build with OpenWrt SDK
-        uses: openwrt/gh-action-sdk@main
-        env:
-          ARCH: aarch64_cortex-a53-${{ steps.sdkver.outputs.tag }}
-          TARGET: ${{ github.event.inputs.target }}
-          VERSION: ${{ steps.sdkver.outputs.tag }}
-          FEEDNAME: athena_ci
-          PACKAGES: athena-led luci-app-athena-led
-          NO_REFRESH_CHECK: 1
-          EXTRA_FEEDS: >
-            src-git athena_ci ${{ env.PKG_REPO }}^${{ github.event.inputs.pkg_branch }}
+      - name: Start SDK container
+        run: |
+          docker run -dit \
+            --name sdk \
+            -v ${{ env.WORK_DIR }}:/home/build/AX6600-Athena-LED-Controller \
+            ghcr.io/openwrt/sdk:${{ env.ARCH }}-${{ inputs.version }} \
+            /bin/bash
 
-      # gh-action-sdk 默认不会自动修 Makefile 版本号，这里兜底处理
+      - name: Configure feeds (TUNA mirror)
+        run: |
+          docker exec sdk bash -c "
+            set -e
+            cat > feeds.conf << 'EOF'
+src-git packages https://mirrors.tuna.tsinghua.edu.cn/git/openwrt/feed/packages.git
+src-git luci https://mirrors.tuna.tsinghua.edu.cn/git/openwrt/luci.git
+src-git routing https://mirrors.tuna.tsinghua.edu.cn/git/openwrt/feed/routing.git
+src-git telephony https://mirrors.tuna.tsinghua.edu.cn/git/openwrt/feed/telephony.git
+EOF
+          "
+
+      - name: Update feeds
+        run: |
+          docker exec sdk bash -c "
+            set -e
+            ./scripts/feeds update -a
+            ./scripts/feeds install -a
+          "
+
+      - name: Prepare package
+        run: |
+          docker exec sdk bash -c "
+            set -e
+            mkdir -p package/network/utils/athena-led
+            cp -r /home/build/AX6600-Athena-LED-Controller/* package/network/utils/athena-led/ || true
+          "
+
       - name: Patch athena-led Makefile to 2.4.0
         run: |
-          find . -path '*athena-led*/Makefile' | while read f; do
-            echo ">> patch $f"
-            sed -i \
-              -e 's/PKG_VERSION:=.*/PKG_VERSION:=2.4.0/' \
-              -e 's/PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz/PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v2.4.0.tar.gz/' \
-              -e 's#PKG_SOURCE_URL:=.*v2.5.0/#PKG_SOURCE_URL:=https://github.com/unraveloop/JDC-AX6600-Athena-LED-Controller/releases/download/v2.4.0/#' \
-              -e '/PKG_HASH:=/d' \
-              -e '/^PKG_MAINTAINER/a PKG_HASH:=skip' \
-              "$f"
-          done
+          docker exec sdk bash -c "
+            set -e
+            sed -i 's/PKG_VERSION:=.*/PKG_VERSION:=2.4.0/' package/network/utils/athena-led/Makefile
+          "
 
-      - name: Rebuild after patch
-        uses: openwrt/gh-action-sdk@main
-        env:
-          ARCH: aarch64_cortex-a53-${{ steps.sdkver.outputs.tag }}
-          TARGET: ${{ github.event.inputs.target }}
-          VERSION: ${{ steps.sdkver.outputs.tag }}
-          FEEDNAME: athena_ci
-          PACKAGES: athena-led luci-app-athena-led
-          NO_REFRESH_CHECK: 1
-          EXTRA_FEEDS: >
-            src-git athena_ci ${{ env.PKG_REPO }}^${{ github.event.inputs.pkg_branch }}
+      - name: Build package
+        run: |
+          docker exec sdk bash -c "
+            set -e
+            make defconfig
+            make package/athena-led/compile V=s
+          "
+
+      - name: Fix ownership (safe)
+        run: |
+          sudo chown -R 1000:1000 ${{ env.WORK_DIR }}
 
       - name: Upload ipk as Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: athena-led-ipk-aarch64_cortex-a53
+          name: athena-led-2.4.0-${{ inputs.version }}
           path: |
-            bin/packages/aarch64_cortex-a53/athena_ci/*.ipk
-            bin/packages/aarch64_cortex-a53/base/athena-led*.ipk
-            bin/packages/aarch64_cortex-a53/base/luci-app-athena-led*.ipk
-            bin/packages/aarch64_cortex-a53/base/luci-i18n-athena-led-zh-cn*.ipk
+            bin/packages/${{ env.ARCH }}/base/athena-led*.ipk
+            bin/packages/${{ env.ARCH }}/*/athena-led*.ipk
           if-no-files-found: error
-
-      - name: Generate release tag
-        id: tag
-        run: echo "tag=$(date +'%Y.%m.%d-%H%M')-athena-led" >> $GITHUB_OUTPUT
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          files: |
-            bin/packages/aarch64_cortex-a53/athena_ci/*.ipk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
