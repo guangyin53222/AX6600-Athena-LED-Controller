@@ -1,12 +1,4 @@
-#
-# athena-led - JDCloud AX6600 (Athena) LED Matrix Controller Core
-# Feed package Makefile
-#
-# Installation via feed:
-#   echo "src-git athena https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git;main" >> feeds.conf
-#   ./scripts/feeds update athena
-#   ./scripts/feeds install -a -p athena
-#
+# SPDX-License-Identifier: GPL-2.0-only
 
 include $(TOPDIR)/rules.mk
 
@@ -14,90 +6,52 @@ PKG_NAME:=athena-led
 PKG_VERSION:=2.5.0
 PKG_RELEASE:=1
 
-PKG_MAINTAINER:=guangyin53222
-PKG_LICENSE:=Apache-2.0
-PKG_LICENSE_FILES:=LICENSE
-
-# Pre-compiled Rust binary (aarch64-unknown-linux-musl)
-PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v$(PKG_VERSION).tar.gz
+# 使用预编译的 musl 二进制（由 CI 的 build-rust job 产出）
+PKG_SOURCE_NAME:=athena-led-aarch64-unknown-linux-musl-v$(PKG_VERSION).tar.gz
+PKG_SOURCE:=$(PKG_SOURCE_NAME)
 PKG_SOURCE_URL:=https://github.com/guangyin53222/AX6600-Athena-LED-Controller/releases/download/v$(PKG_VERSION)/
 PKG_HASH:=skip
 
+PKG_MAINTAINER:=guangyin53222
+PKG_LICENSE:=Apache-2.0
+
 include $(INCLUDE_DIR)/package.mk
 
-define Package/$(PKG_NAME)
+define Package/athena-led
   SECTION:=utils
   CATEGORY:=Utilities
-  TITLE:=JDCloud AX6600 (Athena) LED matrix screen daemon
-  URL:=https://github.com/guangyin53222/AX6600-Athena-LED-Controller
-  DEPENDS:=@(aarch64||arm)
+  TITLE:=AX6600 Athena LED Matrix Controller (Core)
+  DEPENDS:=@USE_MUSL @aarch64
 endef
 
-define Package/$(PKG_NAME)/description
- Rust daemon driving the JDCloud AX6600 (Athena) LED matrix screen.
- Features: network monitoring, system status, weather, smart sleep,
- MQTT integration, GPIO dual-backend auto-detection (cdev/sysfs).
+define Package/athena-led/description
+  Core driver for JDCloud AX6600 (Athena) LED matrix display.
+  Controls the LED panel via I2C/SPID.
+  Pre-compiled static binary (aarch64-unknown-linux-musl).
 endef
 
-define Build/Prepare
-	mkdir -p $(PKG_BUILD_DIR)
-	tar xf $(DL_DIR)/$(PKG_SOURCE) -C $(PKG_BUILD_DIR)
-endef
-
-# Pre-compiled binary, no build step needed
+# 不需要 Rust 编译——直接用预编译好的静态二进制
 define Build/Compile
+	# 二进制已经在 Build/Prepare 阶段从 tarball 解压出来了
+	# 确认它在 build dir 里
+	ls -la $(PKG_BUILD_DIR)/athena-led
 endef
 
-define Package/$(PKG_NAME)/conffiles
-/etc/config/athena_led
-endef
-
-define Package/$(PKG_NAME)/install
-	# 1. Main binary
+define Package/athena-led/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/athena-led $(1)/usr/bin/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/athena-led $(1)/usr/bin/athena-led
 
-	# 2. Button detection script
-	$(INSTALL_BIN) ./files/find_button.sh $(1)/usr/bin/find_button
-
-	# 3. init.d script
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/athena_led.init $(1)/etc/init.d/athena_led
-
-	# 4. UCI config
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) ./files/athena_led.config $(1)/etc/config/athena_led
-
-	# 5. Preset animations
-	$(INSTALL_DIR) $(1)/etc/athena_led/anim
-	$(CP) ./files/anim/*.bin $(1)/etc/athena_led/anim/ 2>/dev/null || true
-endef
-
-define Package/$(PKG_NAME)/postinst
-#!/bin/sh
-if [ -z "$${IPKG_INSTROOT}" ]; then
-	# Config migration for upgrades
-	if [ -f /etc/config/athena_led.apk-new ]; then
-		mv /etc/config/athena_led /etc/config/athena_led.v1_bak 2>/dev/null
-		mv /etc/config/athena_led.apk-new /etc/config/athena_led
+	# 安装 init 脚本（如果 files/ 里有）
+	if [ -f ./files/etc/init.d/athena-led ]; then \
+		$(INSTALL_DIR) $(1)/etc/init.d; \
+		$(INSTALL_BIN) ./files/etc/init.d/athena-led $(1)/etc/init.d/; \
 	fi
-	if [ -f /etc/config/athena_led-opkg ]; then
-		mv /etc/config/athena_led /etc/config/athena_led.v1_bak 2>/dev/null
-		mv /etc/config/athena_led-opkg /etc/config/athena_led
+
+	# 安装 UCI 默认配置（如果 files/ 里有）
+	if [ -f ./files/etc/config/athena-led ]; then \
+		$(INSTALL_DIR) $(1)/etc/config; \
+		$(INSTALL_CONF) ./files/etc/config/athena-led $(1)/etc/config/; \
 	fi
-	/etc/init.d/athena_led enable 2>/dev/null
-	/etc/init.d/athena_led restart >/dev/null 2>&1
-fi
-exit 0
 endef
 
-define Package/$(PKG_NAME)/prerm
-#!/bin/sh
-if [ -z "$${IPKG_INSTROOT}" ]; then
-	/etc/init.d/athena_led stop >/dev/null 2>&1
-	/etc/init.d/athena_led disable 2>/dev/null
-fi
-exit 0
-endef
-
-$(eval $(call BuildPackage,$(PKG_NAME)))
+$(eval $(call BuildPackage,athena-led))
