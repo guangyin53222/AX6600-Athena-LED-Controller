@@ -202,4 +202,4 @@ jobs:
             sdk/bin/**/*athena-led*.${{ matrix.type }}
             sdk/bin/sha256sums-${{ matrix.type }}.txt
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
