@@ -6,7 +6,7 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      tag:
+      release_tag:
         description: 'Release tag (e.g. v2.5.0)'
         required: true
         default: 'v2.5.0'
@@ -16,11 +16,8 @@ env:
   RUST_VERSION: stable
 
 jobs:
-  # ============================================================
-  # Job 1: Build Rust core binary (aarch64-musl)
-  # ============================================================
   build-rust:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -30,327 +27,191 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      # 安装 aarch64 交叉编译工具链（musl）
-      # 这是修复 exit 101 的关键：ring/rumqttc 等 crate 的 C 代码
-      # 需要 aarch64-linux-musl-gcc 来编译
-      - name: Install aarch64-musl cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
 
-          # 下载静态的 aarch64-musl 交叉编译器
-          # 使用 musl.cc 的 GitHub 镜像（避免被屏蔽）
-          wget -q "https://github.com/just-containers/musl-cross/releases/download/v0.9.10/aarch64-linux-musl-cross.tgz" \
-               -O /tmp/aarch64-musl.tgz || \
-          wget -q "https://musl.cc/aarch64-linux-musl-cross.tgz" \
-               -O /tmp/aarch64-musl.tgz
-
-          sudo tar xzf /tmp/aarch64-musl.tgz -C /opt/
-          export PATH="/opt/aarch64-linux-musl-cross/bin:$PATH"
-          aarch64-linux-musl-gcc --version
-
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-
-      - name: Configure Cargo for cross-compile
-        run: |
-          mkdir -p ~/.cargo
-          cat > ~/.cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-musl-gcc"
-          ar = "aarch64-linux-musl-ar"
-          EOF
-          cat ~/.cargo/config.toml
-
-      - name: Set cross-compile env vars
-        run: |
-          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc" >> $GITHUB_ENV
-          echo "AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar" >> $GITHUB_ENV
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> $GITHUB_ENV
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
 
       - name: Cache Cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "athena-led"
+          workspaces: |
+            athena-led/src -> target
 
-      - name: Build athena-led (aarch64-unknown-linux-musl)
-        working-directory: athena-led
+      - name: Build athena-led (aarch64-musl via Zig)
         run: |
-          cargo build --release --target aarch64-unknown-linux-musl
-          ls -la target/aarch64-unknown-linux-musl/release/athena-led
+          cd athena-led/src
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
 
       - name: Strip binary
         run: |
-          aarch64-linux-musl-strip athena-led/target/aarch64-unknown-linux-musl/release/athena-led || \
-          aarch64-linux-gnu-strip athena-led/target/aarch64-unknown-linux-musl/release/athena-led || \
-          echo "strip failed, continuing"
+          zig strip athena-led/src/target/aarch64-unknown-linux-musl/release/athena-led
 
       - name: Verify binary
         run: |
-          file athena-led/target/aarch64-unknown-linux-musl/release/athena-led
+          file athena-led/src/target/aarch64-unknown-linux-musl/release/athena-led
 
       - name: Package binary tarball
         run: |
-          cd athena-led/target/aarch64-unknown-linux-musl/release
-          tar czf /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz athena-led
-          cd /tmp
-          sha256sum athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz > athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz.sha256
-          cat athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz.sha256
+          VERSION="${{ github.event.inputs.release_tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cd athena-led/src/target/aarch64-unknown-linux-musl/release
+          tar czf "../../../../../athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz" athena-led
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: athena-led-binary
-          path: |
-            /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz
-            /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz.sha256
+          path: athena-led-aarch64-unknown-linux-musl-v*.tar.gz
 
-  # ============================================================
-  # Job 2: Build ipk packages (OpenWrt 23.05 / 24.10 SDK)
-  # ============================================================
   build-ipk:
     needs: build-rust
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - sdk: "https://downloads.openwrt.org/releases/23.05.5/targets/qualcommax/ipq60xx/openwrt-sdk-23.05.5-qualcommax-ipq60xx_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-            name: "23.05"
-          - sdk: "https://downloads.openwrt.org/releases/24.10.2/targets/qualcommax/ipq60xx/openwrt-sdk-24.10.2-qualcommax-ipq60xx_gcc-13.3.0_musl.Linux-x86_64.tar.xz"
-            name: "24.10"
-
+        sdk:
+          - { url: "https://downloads.openwrt.org/releases/23.05.5/targets/mediatek/filogic/openwrt-sdk-23.05.5-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz", name: "23.05" }
+          - { url: "https://downloads.openwrt.org/releases/24.10.1/targets/mediatek/filogic/openwrt-sdk-24.10.1-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.xz", name: "24.10" }
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Download Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: athena-led-binary
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget tar xz-utils
+          sudo apt-get install -y zstd dos2unix
 
-      - name: Download Rust binary
-        uses: actions/download-artifact@v4
-        with:
-          name: athena-led-binary
-          path: /tmp
-
-      - name: Download OpenWrt SDK
+      - name: Download & extract SDK
         run: |
-          wget -q "${{ matrix.sdk }}" -O /tmp/sdk.tar.xz
+          wget -q "${{ matrix.sdk.url }}" -O /tmp/sdk.tar.xz
           mkdir -p /opt/sdk
           tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
-          ls /opt/sdk/
 
-      - name: Prepare SDK with packages
+      - name: Setup packages
+        run: |
+          VERSION="${{ github.event.inputs.release_tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          SDK=/opt/sdk
+          mkdir -p ${SDK}/package/athena-led
+          cp athena-led/Makefile ${SDK}/package/athena-led/
+          mkdir -p ${SDK}/package/luci-app-athena-led
+          cp luci-app-athena-led/Makefile ${SDK}/package/luci-app-athena-led/
+          mkdir -p ${SDK}/package/athena-led/src/bin
+          tar xzf athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz -C ${SDK}/package/athena-led/src/bin/ --strip-components=1
+          if [ -d "athena-led/files" ]; then cp -r athena-led/files ${SDK}/package/athena-led/; fi
+
+      - name: Build packages
         run: |
           cd /opt/sdk
-          # Create feed directory structure
-          mkdir -p package/athena-feed/athena-led/files/usr/bin
-          mkdir -p package/athena-feed/luci-app-athena-led
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/athena-led/compile V=s
+          make package/luci-app-athena-led/compile V=s
 
-          # Add our feed
-          echo "src-link athena $(pwd)/package/athena-feed" > feeds.conf
-
-      - name: Copy athena-led package files
+      - name: Collect ipk
         run: |
-          cp -r athena-led/Makefile /opt/sdk/package/athena-feed/athena-led/
-          cp -r athena-led/files /opt/sdk/package/athena-feed/athena-led/
-          # Copy pre-compiled binary into SDK's dl/ directory
-          mkdir -p /opt/sdk/dl
-          cp /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz /opt/sdk/dl/
+          mkdir -p /tmp/ipk-out
+          find /opt/sdk/bin -name "*.ipk" -exec cp {} /tmp/ipk-out/ \;
 
-      - name: Copy luci-app-athena-led package files
-        run: |
-          cp -r luci-app-athena-led/Makefile /opt/sdk/package/athena-feed/luci-app-athena-led/
-          # Copy all luci app source directories if they exist
-          for dir in htdocs luasrc po root src; do
-            if [ -d "luci-app-athena-led/$dir" ]; then
-              cp -r luci-app-athena-led/$dir /opt/sdk/package/athena-feed/luci-app-athena-led/
-            fi
-          done
-
-      - name: Update feeds and install
-        working-directory: /opt/sdk
-        run: |
-          ./scripts/feeds update athena
-          ./scripts/feeds install -a -p athena
-
-      - name: Compile athena-led
-        working-directory: /opt/sdk
-        run: |
-          make package/athena-feed/athena-led/compile V=s
-
-      - name: Compile luci-app-athena-led
-        working-directory: /opt/sdk
-        run: |
-          make package/athena-feed/luci-app-athena-led/compile V=s
-
-      - name: Collect ipk artifacts
-        run: |
-          mkdir -p /tmp/ipk-${{ matrix.name }}
-          find /opt/sdk/bin -name "*.ipk" -exec cp {} /tmp/ipk-${{ matrix.name }}/ \;
-          ls -la /tmp/ipk-${{ matrix.name }}/
-
-      - name: Upload ipk artifacts
+      - name: Upload ipk
         uses: actions/upload-artifact@v4
         with:
-          name: ipk-${{ matrix.name }}
-          path: /tmp/ipk-${{ matrix.name }}/*.ipk
+          name: ipk-${{ matrix.sdk.name }}
+          path: /tmp/ipk-out/*.ipk
 
-  # ============================================================
-  # Job 3: Build apk packages (OpenWrt snapshot / apk)
-  # ============================================================
   build-apk:
     needs: build-rust
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies (including zstd)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget tar xz-utils zstd
-
       - name: Download Rust binary
         uses: actions/download-artifact@v4
         with:
           name: athena-led-binary
-          path: /tmp
 
-      - name: Download OpenWrt SDK (snapshot for apk)
+      - name: Install dependencies
         run: |
-          # Try zst first, fallback to xz
-          SDK_BASE="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx"
-          if wget -q "$SDK_BASE/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.zst" -O /tmp/sdk.tar.zst; then
-            echo "Downloaded zst SDK"
-            mkdir -p /opt/sdk
-            tar --use-compress-program=unzstd -xf /tmp/sdk.tar.zst -C /opt/sdk --strip-components=1
-          elif wget -q "$SDK_BASE/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.xz" -O /tmp/sdk.tar.xz; then
-            echo "Downloaded xz SDK"
-            mkdir -p /opt/sdk
-            tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
-          else
-            echo "ERROR: Failed to download SDK from $SDK_BASE"
-            exit 1
-          fi
-          ls /opt/sdk/
+          sudo apt-get update
+          sudo apt-get install -y zstd apk-tools
 
-      - name: Prepare SDK with packages
+      - name: Download snapshot SDK
+        run: |
+          BASE="https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/"
+          SDK_NAME=$(curl -s "${BASE}" | grep -o 'openwrt-sdk[^"]*\.tar\.zst' | head -1)
+          wget -q "${BASE}${SDK_NAME}" -O /tmp/sdk.tar.zst
+
+      - name: Extract SDK
+        run: |
+          mkdir -p /opt/sdk
+          tar --use-compress-program=unzstd -xf /tmp/sdk.tar.zst -C /opt/sdk --strip-components=1
+          [ -d /opt/sdk/bin ] || { echo "SDK extract failed!"; exit 1; }
+
+      - name: Setup packages
+        run: |
+          VERSION="${{ github.event.inputs.release_tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          SDK=/opt/sdk
+          mkdir -p ${SDK}/package/athena-led/src/bin
+          mkdir -p ${SDK}/package/luci-app-athena-led
+          cp athena-led/Makefile ${SDK}/package/athena-led/
+          cp luci-app-athena-led/Makefile ${SDK}/package/luci-app-athena-led/
+          tar xzf athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz -C ${SDK}/package/athena-led/src/bin/ --strip-components=1
+          if [ -d "athena-led/files" ]; then cp -r athena-led/files ${SDK}/package/athena-led/; fi
+
+      - name: Build apk packages
         run: |
           cd /opt/sdk
-          mkdir -p package/athena-feed/athena-led/files
-          mkdir -p package/athena-feed/luci-app-athena-led
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/athena-led/compile V=s
+          make package/luci-app-athena-led/compile V=s
 
-          echo "src-link athena $(pwd)/package/athena-feed" > feeds.conf
-
-          # athena-led
-          cp -r ${{ github.workspace }}/athena-led/Makefile package/athena-feed/athena-led/
-          cp -r ${{ github.workspace }}/athena-led/files package/athena-feed/athena-led/
-          mkdir -p dl
-          cp /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz dl/
-
-          # luci-app
-          cp -r ${{ github.workspace }}/luci-app-athena-led/Makefile package/athena-feed/luci-app-athena-led/
-          for dir in htdocs luasrc po root src; do
-            if [ -d "${{ github.workspace }}/luci-app-athena-led/$dir" ]; then
-              cp -r ${{ github.workspace }}/luci-app-athena-led/$dir package/athena-feed/luci-app-athena-led/
-            fi
-          done
-
-      - name: Update feeds and compile
-        working-directory: /opt/sdk
+      - name: Collect apk
         run: |
-          ./scripts/feeds update athena
-          ./scripts/feeds install -a -p athena
-          make package/athena-feed/athena-led/compile V=s
-          make package/athena-feed/luci-app-athena-led/compile V=s
+          mkdir -p /tmp/apk-out
+          find /opt/sdk/bin -name "*.apk" -exec cp {} /tmp/apk-out/ \;
 
-      - name: Collect apk artifacts
-        run: |
-          mkdir -p /tmp/apk
-          find /opt/sdk/bin -name "*.apk" -exec cp {} /tmp/apk/ \;
-          ls -la /tmp/apk/
-
-      - name: Upload apk artifacts
+      - name: Upload apk
         uses: actions/upload-artifact@v4
         with:
           name: apk-snapshot
-          path: /tmp/apk/*.apk
+          path: /tmp/apk-out/*.apk
 
-  # ============================================================
-  # Job 4: Create GitHub Release
-  # ============================================================
   release:
     needs: [build-rust, build-ipk, build-apk]
-    runs-on: ubuntu-24.04
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/artifacts
+          path: /tmp/all-artifacts
 
       - name: Prepare release files
         run: |
           mkdir -p /tmp/release
-          # Binary
-          cp /tmp/artifacts/athena-led-binary/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz /tmp/release/
-          cp /tmp/artifacts/athena-led-binary/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz.sha256 /tmp/release/
-          # ipk 23.05
-          cp /tmp/artifacts/ipk-23.05/*.ipk /tmp/release/ 2>/dev/null || true
-          # ipk 24.10
-          cp /tmp/artifacts/ipk-24.10/*.ipk /tmp/release/ 2>/dev/null || true
-          # apk
-          cp /tmp/artifacts/apk-snapshot/*.apk /tmp/release/ 2>/dev/null || true
-          ls -la /tmp/release/
+          find /tmp/all-artifacts -type f \( -name "*.tar.gz" -o -name "*.ipk" -o -name "*.apk" \) -exec cp {} /tmp/release/ \;
+          cd /tmp/release
+          sha256sum * > sha256sums
 
-      - name: Get tag name
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Release
+      - name: Create/Update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Athena LED Controller ${{ steps.tag.outputs.tag }}
-          body: |
-            ## AX6600 Athena LED Controller ${{ steps.tag.outputs.tag }}
-
-            ### 📦 安装包
-
-            | 文件 | 说明 |
-            |------|------|
-            | `athena-led_*.ipk` + `luci-app-athena-led_*.ipk` | OpenWrt 23.05 / 24.10 (opkg) |
-            | `athena-led_*.apk` + `luci-app-athena-led_*.apk` | OpenWrt Snapshot (apk) |
-            | `athena-led-aarch64-unknown-linux-musl-v*.tar.gz` | 仅核心二进制 |
-
-            ### 🅰️ OpenWrt 23.05 / 24.10 (opkg)
-            ```bash
-            opkg install athena-led_*.ipk luci-app-athena-led_*.ipk
-            ```
-
-            ### 🅱️ OpenWrt Snapshot (apk)
-            ```bash
-            apk add --allow-untrusted athena-led_*.apk luci-app-athena-led_*.apk
-            ```
-
-            ### 🔧 从 Feed 编译
-            ```bash
-            echo "src-git athena https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git;main" >> feeds.conf
-            ./scripts/feeds update athena
-            ./scripts/feeds install -a -p athena
-            make menuconfig
-            ```
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          name: ${{ github.event.inputs.release_tag || github.ref_name }}
           files: /tmp/release/*
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          overwrite: true
