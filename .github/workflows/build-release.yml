@@ -1,0 +1,295 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2.5.0)'
+        required: true
+        default: 'v2.5.0'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: stable
+
+jobs:
+  # ============================================================
+  # Job 1: Build Rust core binary (aarch64-musl)
+  # ============================================================
+  build-rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build athena-led (aarch64-unknown-linux-musl)
+        working-directory: athena-led
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl
+          ls -la target/aarch64-unknown-linux-musl/release/athena-led
+
+      - name: Strip binary
+        run: |
+          aarch64-linux-gnu-strip athena-led/target/aarch64-unknown-linux-musl/release/athena-led 2>/dev/null || \
+          llvm-strip athena-led/target/aarch64-unknown-linux-musl/release/athena-led 2>/dev/null || \
+          echo "strip not available, skipping"
+
+      - name: Package binary tarball
+        run: |
+          cd athena-led/target/aarch64-unknown-linux-musl/release
+          tar czf /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz athena-led
+          cd /tmp
+          sha256sum athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz > athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz.sha256
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: athena-led-binary
+          path: |
+            /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz
+            /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz.sha256
+
+  # ============================================================
+  # Job 2: Build ipk packages (OpenWrt 23.05 / 24.10 SDK)
+  # ============================================================
+  build-ipk:
+    needs: build-rust
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - sdk: "https://downloads.openwrt.org/releases/23.05.5/targets/qualcommax/ipq60xx/openwrt-sdk-23.05.5-qualcommax-ipq60xx_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+            name: "23.05"
+          - sdk: "https://downloads.openwrt.org/releases/24.10.2/targets/qualcommax/ipq60xx/openwrt-sdk-24.10.2-qualcommax-ipq60xx_gcc-13.3.0_musl.Linux-x86_64.tar.xz"
+            name: "24.10"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: athena-led-binary
+          path: /tmp
+
+      - name: Download OpenWrt SDK
+        run: |
+          wget -q "${{ matrix.sdk }}" -O /tmp/sdk.tar.xz
+          mkdir -p /opt/sdk
+          tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
+          ls /opt/sdk/
+
+      - name: Prepare SDK environment
+        run: |
+          cd /opt/sdk
+          # Add our feed
+          echo "src-link athena $(pwd)/package/athena-feed" > feeds.conf
+          # Create feed directory with our packages
+          mkdir -p package/athena-feed/athena-led/files/usr/bin
+          mkdir -p package/athena-feed/luci-app-athena-led
+
+      - name: Copy athena-led package files
+        run: |
+          cp -r athena-led/Makefile /opt/sdk/package/athena-feed/athena-led/
+          cp -r athena-led/files /opt/sdk/package/athena-feed/athena-led/
+          # Extract pre-compiled binary into the build dir
+          mkdir -p /opt/sdk/dl
+          cp /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz /opt/sdk/dl/
+
+      - name: Copy luci-app-athena-led package files
+        run: |
+          cp -r luci-app-athena-led/Makefile /opt/sdk/package/athena-feed/luci-app-athena-led/
+          cp -r luci-app-athena-led/htdocs /opt/sdk/package/athena-feed/luci-app-athena-led/
+          cp -r luci-app-athena-led/luasrc /opt/sdk/package/athena-feed/luci-app-athena-led/
+          cp -r luci-app-athena-led/po /opt/sdk/package/athena-feed/luci-app-athena-led/
+          cp -r luci-app-athena-led/root /opt/sdk/package/athena-feed/luci-app-athena-led/
+
+      - name: Update feeds and install
+        working-directory: /opt/sdk
+        run: |
+          ./scripts/feeds update athena
+          ./scripts/feeds install -a -p athena
+
+      - name: Compile athena-led
+        working-directory: /opt/sdk
+        run: |
+          make package/athena-feed/athena-led/compile V=s
+
+      - name: Compile luci-app-athena-led
+        working-directory: /opt/sdk
+        run: |
+          make package/athena-feed/luci-app-athena-led/compile V=s
+
+      - name: Collect ipk artifacts
+        run: |
+          mkdir -p /tmp/ipk-${{ matrix.name }}
+          find /opt/sdk/bin -name "*.ipk" -exec cp {} /tmp/ipk-${{ matrix.name }}/ \;
+          ls -la /tmp/ipk-${{ matrix.name }}/
+
+      - name: Upload ipk artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ matrix.name }}
+          path: /tmp/ipk-${{ matrix.name }}/*.ipk
+
+  # ============================================================
+  # Job 3: Build apk packages (OpenWrt snapshot / apk)
+  # ============================================================
+  build-apk:
+    needs: build-rust
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: athena-led-binary
+          path: /tmp
+
+      - name: Download OpenWrt SDK (snapshot for apk)
+        run: |
+          # Use the latest snapshot SDK
+          SDK_URL="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.zst"
+          wget -q "$SDK_URL" -O /tmp/sdk.tar.zst || {
+            echo "zst download failed, trying xz..."
+            wget -q "https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.xz" -O /tmp/sdk.tar.xz
+            mkdir -p /opt/sdk
+            tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
+          }
+          if [ ! -d /opt/sdk ]; then
+            mkdir -p /opt/sdk
+            tar xf /tmp/sdk.tar.zst -C /opt/sdk --strip-components=1
+          fi
+          ls /opt/sdk/
+
+      - name: Prepare SDK with packages
+        run: |
+          cd /opt/sdk
+          echo "src-link athena $(pwd)/package/athena-feed" > feeds.conf
+          mkdir -p package/athena-feed/athena-led/files
+          mkdir -p package/athena-feed/luci-app-athena-led
+
+          # athena-led
+          cp -r ${{ github.workspace }}/athena-led/Makefile package/athena-feed/athena-led/
+          cp -r ${{ github.workspace }}/athena-led/files package/athena-feed/athena-led/
+          mkdir -p dl
+          cp /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz dl/
+
+          # luci-app
+          cp -r ${{ github.workspace }}/luci-app-athena-led/Makefile package/athena-feed/luci-app-athena-led/
+          cp -r ${{ github.workspace }}/luci-app-athena-led/htdocs package/athena-feed/luci-app-athena-led/
+          cp -r ${{ github.workspace }}/luci-app-athena-led/luasrc package/athena-feed/luci-app-athena-led/
+          cp -r ${{ github.workspace }}/luci-app-athena-led/po package/athena-feed/luci-app-athena-led/
+          cp -r ${{ github.workspace }}/luci-app-athena-led/root package/athena-feed/luci-app-athena-led/
+
+      - name: Update feeds and compile
+        working-directory: /opt/sdk
+        run: |
+          ./scripts/feeds update athena
+          ./scripts/feeds install -a -p athena
+          make package/athena-feed/athena-led/compile V=s
+          make package/athena-feed/luci-app-athena-led/compile V=s
+
+      - name: Collect apk artifacts
+        run: |
+          mkdir -p /tmp/apk
+          find /opt/sdk/bin -name "*.apk" -exec cp {} /tmp/apk/ \;
+          ls -la /tmp/apk/
+
+      - name: Upload apk artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-snapshot
+          path: /tmp/apk/*.apk
+
+  # ============================================================
+  # Job 4: Create GitHub Release
+  # ============================================================
+  release:
+    needs: [build-rust, build-ipk, build-apk]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p /tmp/release
+          # Binary
+          cp /tmp/artifacts/athena-led-binary/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz /tmp/release/
+          cp /tmp/artifacts/athena-led-binary/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz.sha256 /tmp/release/
+          # ipk 23.05
+          cp /tmp/artifacts/ipk-23.05/*.ipk /tmp/release/ 2>/dev/null || true
+          # ipk 24.10
+          cp /tmp/artifacts/ipk-24.10/*.ipk /tmp/release/ 2>/dev/null || true
+          # apk
+          cp /tmp/artifacts/apk-snapshot/*.apk /tmp/release/ 2>/dev/null || true
+          ls -la /tmp/release/
+
+      - name: Get tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Athena LED Controller ${{ steps.tag.outputs.tag }}
+          body: |
+            ## AX6600 Athena LED Controller ${{ steps.tag.outputs.tag }}
+
+            ### 📦 安装包
+
+            | 文件 | 说明 |
+            |------|------|
+            | `athena-led_*.ipk` + `luci-app-athena-led_*.ipk` | OpenWrt 23.05 / 24.10 (opkg) |
+            | `athena-led_*.apk` + `luci-app-athena-led_*.apk` | OpenWrt Snapshot (apk) |
+            | `athena-led-aarch64-unknown-linux-musl-v*.tar.gz` | 仅核心二进制 |
+
+            ### 🅰️ OpenWrt 23.05 / 24.10 (opkg)
+            ```bash
+            opkg install athena-led_*.ipk luci-app-athena-led_*.ipk
+            ```
+
+            ### 🅱️ OpenWrt Snapshot (apk)
+            ```bash
+            apk add --allow-untrusted athena-led_*.apk luci-app-athena-led_*.apk
+            ```
+
+            ### 🔧 从 Feed 编译
+            ```bash
+            echo "src-git athena https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git;main" >> feeds.conf
+            ./scripts/feeds update athena
+            ./scripts/feeds install -a -p athena
+            make menuconfig  # Utilities → athena-led, LuCI → Applications → luci-app-athena-led
+            ```
+          files: /tmp/release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
