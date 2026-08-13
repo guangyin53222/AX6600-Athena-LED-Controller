@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (e.g. v2.5.0)'
+        description: 'Release tag (e.g. v)'
         required: true
-        default: 'v2.5.0'
+        default: 'v'
 
 env:
   CARGO_TERM_COLOR: always
