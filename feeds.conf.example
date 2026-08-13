@@ -1,23 +1,2 @@
-# ============================================================
-# AX6600 Athena LED Controller - Feed 配置示例
-# 将此文件内容添加到你的 OpenWrt 源码根目录的 feeds.conf 中
-# ============================================================
-
-# 方式一：使用 main 分支（跟随最新开发版）
+# Athena LED Controller Feed
 src-git athena https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git;main
-
-# 方式二：锁定到特定版本 tag（推荐用于稳定编译）
-# src-git athena https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git;v2.5.0
-
-# 方式三：使用 SSH（如果你配置了 GitHub SSH key）
-# src-git athena git@github.com:guangyin53222/AX6600-Athena-LED-Controller.git;main
-
-# ============================================================
-# 添加后执行：
-#   ./scripts/feeds update athena
-#   ./scripts/feeds install -a -p athena
-#
-# 然后在 make menuconfig 中选择：
-#   Utilities  --->  <*> athena-led
-#   LuCI  --->  3. Applications  --->  <*> luci-app-athena-led
-# ============================================================
