@@ -1,9 +1,10 @@
-# SPDX-License-Identifier: GPL-2.0-only
+# LuCI App - Athena LED Controller
+# Web 界面包，纯 Lua/HTML，PKGARCH=all
 
 include $(TOPDIR)/luci.mk
 
 LUCI_TITLE:=LuCI App - Athena LED Controller
-LUCI_DESCRIPTION:=Web interface for AX6600 Athena LED matrix
+LUCI_DESCRIPTION:=Web interface for JDCloud AX6600 Athena LED matrix controller
 LUCI_DEPENDS:=+athena-led +luci-base
 LUCI_PKGARCH:=all
 
