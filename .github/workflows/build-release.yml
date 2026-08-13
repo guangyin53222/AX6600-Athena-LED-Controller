@@ -25,27 +25,62 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 安装 x86_64 的 musl 工具（musl-tools 提供 musl-gcc，用于 host 端）
+      - name: Install host musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
+
+      # 安装 aarch64-musl 交叉编译工具链
+      # musl.cc 已屏蔽 GitHub Actions IP，改用 GitHub 镜像
+      - name: Install aarch64-linux-musl cross-compiler
+        run: |
+          # 从 GitHub 镜像下载预编译的 aarch64-musl 交叉工具链
+          curl -fsSL https://github.com/arihant2math/prebuilt-musl/raw/main/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-musl.tgz
+          sudo tar xzf /tmp/aarch64-musl.tgz -C /opt/
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          export PATH="/opt/aarch64-linux-musl-cross/bin:$PATH"
+          aarch64-linux-musl-gcc --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Install musl tools
+      # 配置 cargo 使用 musl 交叉编译器作为 linker
+      - name: Configure cargo for aarch64-musl
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << 'EOF'
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-linux-musl-gcc"
+          EOF
 
+      # 缓存 cargo 依赖，加速后续构建
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-24.04-aarch64-musl-cargo-${{ hashFiles('**/Cargo.lock') }}
+          cache-targets: true
+
+      # 关键修复：设置 CC / AR / LINKER 环境变量
+      # 这样 ring、openssl-src 等带 C 代码的 crate 也能正确交叉编译
       - name: Build athena-led (aarch64-unknown-linux-musl)
         working-directory: athena-led
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
         run: |
           cargo build --release --target aarch64-unknown-linux-musl
           ls -la target/aarch64-unknown-linux-musl/release/athena-led
 
       - name: Strip binary
         run: |
-          aarch64-linux-gnu-strip athena-led/target/aarch64-unknown-linux-musl/release/athena-led 2>/dev/null || \
-          llvm-strip athena-led/target/aarch64-unknown-linux-musl/release/athena-led 2>/dev/null || \
-          echo "strip not available, skipping"
+          # 使用 musl 工具链的 strip，不是 gnu 的
+          /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-strip \
+            athena-led/target/aarch64-unknown-linux-musl/release/athena-led || \
+          echo "strip failed, continuing with unstripped binary"
 
       - name: Package binary tarball
         run: |
@@ -93,30 +128,33 @@ jobs:
           tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
           ls /opt/sdk/
 
-      - name: Prepare SDK environment
+      - name: Prepare SDK with our packages
         run: |
           cd /opt/sdk
-          # Add our feed
-          echo "src-link athena $(pwd)/package/athena-feed" > feeds.conf
-          # Create feed directory with our packages
+          # 创建 feed 目录
           mkdir -p package/athena-feed/athena-led/files/usr/bin
           mkdir -p package/athena-feed/luci-app-athena-led
+
+          # 添加 feed 配置
+          echo "src-link athena $(pwd)/package/athena-feed" > feeds.conf
 
       - name: Copy athena-led package files
         run: |
           cp -r athena-led/Makefile /opt/sdk/package/athena-feed/athena-led/
           cp -r athena-led/files /opt/sdk/package/athena-feed/athena-led/
-          # Extract pre-compiled binary into the build dir
+          # 把预编译的二进制放进 dl/ 供 Makefile 使用
           mkdir -p /opt/sdk/dl
           cp /tmp/athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz /opt/sdk/dl/
 
       - name: Copy luci-app-athena-led package files
         run: |
           cp -r luci-app-athena-led/Makefile /opt/sdk/package/athena-feed/luci-app-athena-led/
-          cp -r luci-app-athena-led/htdocs /opt/sdk/package/athena-feed/luci-app-athena-led/
-          cp -r luci-app-athena-led/luasrc /opt/sdk/package/athena-feed/luci-app-athena-led/
-          cp -r luci-app-athena-led/po /opt/sdk/package/athena-feed/luci-app-athena-led/
-          cp -r luci-app-athena-led/root /opt/sdk/package/athena-feed/luci-app-athena-led/
+          # 以下目录如果存在则复制
+          for dir in htdocs luasrc po root; do
+            if [ -d "luci-app-athena-led/$dir" ]; then
+              cp -r "luci-app-athena-led/$dir" /opt/sdk/package/athena-feed/luci-app-athena-led/
+            fi
+          done
 
       - name: Update feeds and install
         working-directory: /opt/sdk
@@ -164,17 +202,17 @@ jobs:
 
       - name: Download OpenWrt SDK (snapshot for apk)
         run: |
-          # Use the latest snapshot SDK
-          SDK_URL="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.zst"
-          wget -q "$SDK_URL" -O /tmp/sdk.tar.zst || {
-            echo "zst download failed, trying xz..."
-            wget -q "https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.xz" -O /tmp/sdk.tar.xz
-            mkdir -p /opt/sdk
-            tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
-          }
-          if [ ! -d /opt/sdk ]; then
+          # 尝试下载 zst 格式，失败则回退到 xz
+          SDK_BASE="https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx"
+          if wget -q "$SDK_BASE/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.zst" -O /tmp/sdk.tar.zst; then
             mkdir -p /opt/sdk
             tar xf /tmp/sdk.tar.zst -C /opt/sdk --strip-components=1
+          elif wget -q "$SDK_BASE/openwrt-sdk-qualcommax-ipq60xx_gcc-14.2.0_musl.Linux-x86_64.tar.xz" -O /tmp/sdk.tar.xz; then
+            mkdir -p /opt/sdk
+            tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
+          else
+            echo "ERROR: Failed to download snapshot SDK" >&2
+            exit 1
           fi
           ls /opt/sdk/
 
@@ -182,7 +220,7 @@ jobs:
         run: |
           cd /opt/sdk
           echo "src-link athena $(pwd)/package/athena-feed" > feeds.conf
-          mkdir -p package/athena-feed/athena-led/files
+          mkdir -p package/athena-feed/athena-led/files/usr/bin
           mkdir -p package/athena-feed/luci-app-athena-led
 
           # athena-led
@@ -193,10 +231,11 @@ jobs:
 
           # luci-app
           cp -r ${{ github.workspace }}/luci-app-athena-led/Makefile package/athena-feed/luci-app-athena-led/
-          cp -r ${{ github.workspace }}/luci-app-athena-led/htdocs package/athena-feed/luci-app-athena-led/
-          cp -r ${{ github.workspace }}/luci-app-athena-led/luasrc package/athena-feed/luci-app-athena-led/
-          cp -r ${{ github.workspace }}/luci-app-athena-led/po package/athena-feed/luci-app-athena-led/
-          cp -r ${{ github.workspace }}/luci-app-athena-led/root package/athena-feed/luci-app-athena-led/
+          for dir in htdocs luasrc po root; do
+            if [ -d "${{ github.workspace }}/luci-app-athena-led/$dir" ]; then
+              cp -r "${{ github.workspace }}/luci-app-athena-led/$dir" package/athena-feed/luci-app-athena-led/
+            fi
+          done
 
       - name: Update feeds and compile
         working-directory: /opt/sdk
@@ -286,7 +325,7 @@ jobs:
             echo "src-git athena https://github.com/guangyin53222/AX6600-Athena-LED-Controller.git;main" >> feeds.conf
             ./scripts/feeds update athena
             ./scripts/feeds install -a -p athena
-            make menuconfig  # Utilities → athena-led, LuCI → Applications → luci-app-athena-led
+            make menuconfig # Utilities → athena-led, LuCI → Applications → luci-app-athena-led
             ```
           files: /tmp/release/*
           draft: false
