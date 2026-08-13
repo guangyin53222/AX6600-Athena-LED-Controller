@@ -84,7 +84,7 @@ jobs:
             athena-led/*.tar.gz
             athena-led/*.sha256
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
 
       # 7. 传递给 OpenWrt 任务
       - name: Pass Artifact to Next Job
