@@ -1,0 +1,254 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. v2.5.0)'
+        required: true
+        default: 'v2.5.0'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: stable
+
+jobs:
+  build-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      # ✅ 用稳定版 Zig（strip 问题用 llvm-strip 绕过，不依赖 zig 子命令）
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Cache Cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            athena-led/src -> target
+
+      - name: Build athena-led (aarch64-musl via Zig)
+        run: |
+          cd athena-led/src
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
+
+      # ✅ 关键修复：zig 没有 strip 子命令，改用 llvm-strip（Zig 工具链自带）
+      - name: Strip binary
+        run: |
+          # 优先用 zig 自带的 llvm-strip，找不到再 fallback 到系统 strip
+          ZIG_ROOT="$(dirname "$(which zig)")"
+          STRIP=""
+          for p in \
+            "${ZIG_ROOT}/../lib/zig/llvm/bin/llvm-strip" \
+            "${ZIG_ROOT}/llvm/bin/llvm-strip" \
+            "$(which llvm-strip 2>/dev/null)" \
+            "$(which aarch64-linux-musl-strip 2>/dev/null)" \
+            "$(which strip 2>/dev/null)"; do
+            if [ -x "$p" ]; then STRIP="$p"; break; fi
+          done
+          if [ -z "$STRIP" ]; then
+            echo "::error::No strip tool found"; exit 1
+          fi
+          echo "Using strip: $STRIP"
+          "$STRIP" athena-led/src/target/aarch64-unknown-linux-musl/release/athena-led
+
+      - name: Verify binary
+        run: |
+          file athena-led/src/target/aarch64-unknown-linux-musl/release/athena-led
+          # 期望: ELF 64-bit LSB executable, ARM aarch64, statically linked
+
+      - name: Package binary tarball
+        run: |
+          VERSION="${{ github.event.inputs.release_tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          BIN="athena-led/src/target/aarch64-unknown-linux-musl/release/athena-led"
+          # ✅ 关键：tar 包内只有 "athena-led" 一个文件，无目录前缀
+          tar czf "athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz" -C "$(dirname "$BIN")" athena-led
+          tar tzf "athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: athena-led-binary
+          path: athena-led-aarch64-unknown-linux-musl-v*.tar.gz
+
+  build-ipk:
+    needs: build-rust
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sdk:
+          - { url: "https://downloads.openwrt.org/releases/23.05.5/targets/mediatek/filogic/openwrt-sdk-23.05.5-mediatek-filogic_gcc-12.3.0_musl.Linux-x86_64.tar.xz", name: "23.05" }
+          - { url: "https://downloads.openwrt.org/releases/24.10.1/targets/mediatek/filogic/openwrt-sdk-24.10.1-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.xz", name: "24.10" }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: athena-led-binary
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd dos2unix
+
+      - name: Download & extract SDK
+        run: |
+          wget -q "${{ matrix.sdk.url }}" -O /tmp/sdk.tar.xz
+          mkdir -p /opt/sdk
+          tar xf /tmp/sdk.tar.xz -C /opt/sdk --strip-components=1
+
+      - name: Setup packages
+        run: |
+          VERSION="${{ github.event.inputs.release_tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          SDK=/opt/sdk
+
+          mkdir -p ${SDK}/package/athena-led
+          cp athena-led/Makefile ${SDK}/package/athena-led/
+
+          mkdir -p ${SDK}/package/luci-app-athena-led
+          cp luci-app-athena-led/Makefile ${SDK}/package/luci-app-athena-led/
+
+          # ✅ 解压到 src/bin/，Makefile 里 $(PKG_BUILD_DIR)/src/bin/athena-led 能找到
+          mkdir -p ${SDK}/package/athena-led/src/bin
+          tar xzf athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz \
+            -C ${SDK}/package/athena-led/src/bin/ --strip-components=1
+
+          if [ -d "athena-led/files" ]; then
+            cp -r athena-led/files ${SDK}/package/athena-led/
+          fi
+
+      - name: Build packages
+        run: |
+          cd /opt/sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/athena-led/compile V=s
+          make package/luci-app-athena-led/compile V=s
+
+      - name: Collect ipk
+        run: |
+          mkdir -p /tmp/ipk-out
+          find /opt/sdk/bin -name "*.ipk" -exec cp {} /tmp/ipk-out/ \;
+
+      - name: Upload ipk
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ matrix.sdk.name }}
+          path: /tmp/ipk-out/*.ipk
+
+  build-apk:
+    needs: build-rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: athena-led-binary
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd apk-tools
+
+      - name: Download snapshot SDK
+        run: |
+          BASE="https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/"
+          SDK_NAME=$(curl -s "${BASE}" | grep -o 'openwrt-sdk[^"]*\.tar\.zst' | head -1)
+          [ -z "$SDK_NAME" ] && { echo "::error::Failed to find snapshot SDK"; exit 1; }
+          wget -q "${BASE}${SDK_NAME}" -O /tmp/sdk.tar.zst
+
+      - name: Extract SDK
+        run: |
+          mkdir -p /opt/sdk
+          tar --use-compress-program=unzstd -xf /tmp/sdk.tar.zst -C /opt/sdk --strip-components=1
+          [ -d /opt/sdk/bin ] || { echo "::error::SDK extract failed!"; exit 1; }
+
+      - name: Setup packages
+        run: |
+          VERSION="${{ github.event.inputs.release_tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          SDK=/opt/sdk
+
+          mkdir -p ${SDK}/package/athena-led/src/bin
+          mkdir -p ${SDK}/package/luci-app-athena-led
+
+          cp athena-led/Makefile ${SDK}/package/athena-led/
+          cp luci-app-athena-led/Makefile ${SDK}/package/luci-app-athena-led/
+
+          tar xzf athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz \
+            -C ${SDK}/package/athena-led/src/bin/ --strip-components=1
+
+          if [ -d "athena-led/files" ]; then
+            cp -r athena-led/files ${SDK}/package/athena-led/
+          fi
+
+      - name: Build apk packages
+        run: |
+          cd /opt/sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/athena-led/compile V=s
+          make package/luci-app-athena-led/compile V=s
+
+      - name: Collect apk
+        run: |
+          mkdir -p /tmp/apk-out
+          find /opt/sdk/bin -name "*.apk" -exec cp {} /tmp/apk-out/ \;
+
+      - name: Upload apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-snapshot
+          path: /tmp/apk-out/*.apk
+
+  release:
+    needs: [build-rust, build-ipk, build-apk]
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/all-artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p /tmp/release
+          find /tmp/all-artifacts -type f \( -name "*.tar.gz" -o -name "*.ipk" -o -name "*.apk" \) -exec cp {} /tmp/release/ \;
+          cd /tmp/release
+          ls -la
+          sha256sum * > sha256sums
+
+      - name: Create/Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          files: /tmp/release/*
+          overwrite: true
