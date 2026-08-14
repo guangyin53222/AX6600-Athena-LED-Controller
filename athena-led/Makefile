@@ -1,6 +1,5 @@
-# 🌟 [包拆分] athena-led 核心包 (OpenWrt 打包用，与同目录的 Rust 工程共存)
-# 负责: 预编译二进制 / init 脚本 / UCI 配置 / 预置动画 / find_button 探测脚本
-# 界面部分见 luci-app-athena-led (纯 UI，PKGARCH=all，依赖本包)
+# athena-led 核心包 Makefile
+# 预编译 Rust 二进制 + init 脚本 + UCI 配置 + 预置动画
 
 include $(TOPDIR)/rules.mk
 
@@ -12,11 +11,10 @@ PKG_MAINTAINER:=unraveloop
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
 
+# 从当前仓库的 GitHub Releases 拉取预编译二进制
 PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v$(PKG_VERSION).tar.gz
-# 🌟 PKG_SOURCE_URL 在本地构建时由 build-chain.yml 注入 dl/ 后删除本行
-PKG_SOURCE_URL:=https://github.com/unraveloop/JDC-AX6600-Athena-LED-Controller/releases/download/v$(PKG_VERSION)/
-# 🌟 新版 OpenWrt download.mk 不认 "skip"，用 "none" 表示跳过校验
-PKG_HASH:=none
+PKG_SOURCE_URL:=https://github.com/guangyin53222/AX6600-Athena-LED-Controller/releases/download/v$(PKG_VERSION)/
+PKG_HASH:=07833cbabc10528c25af70fb5f417381a0bfc4eb6a0a98c76c579e0be51317f3
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -24,15 +22,13 @@ define Package/$(PKG_NAME)
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=JDCloud AX6600 (Athena) LED matrix screen daemon
-  URL:=https://github.com/unraveloop/JDC-AX6600-Athena-LED-Controller
+  URL:=https://github.com/guangyin53222/AX6600-Athena-LED-Controller
   DEPENDS:=@(aarch64||arm)
 endef
 
 define Package/$(PKG_NAME)/description
 Rust daemon driving the JDCloud AX6600 (Athena) LED matrix screen.
-v2.3.0: dual GPIO backend (character device /dev/gpiochipN with
-sysfs fallback), works across QWRT / iStoreOS / official OpenWrt
-kernels without hardcoded GPIO numbers.
+Dual GPIO backend (cdev/sysfs), network monitoring, weather, temperature alert.
 endef
 
 define Build/Prepare
@@ -40,7 +36,7 @@ define Build/Prepare
 	tar xf $(DL_DIR)/$(PKG_SOURCE) -C $(PKG_BUILD_DIR)
 endef
 
-# 二进制为预编译产物，无需编译步骤
+# 预编译二进制，无需编译步骤
 define Build/Compile
 endef
 
@@ -49,22 +45,22 @@ define Package/$(PKG_NAME)/conffiles
 endef
 
 define Package/$(PKG_NAME)/install
-	# 1. 主程序
+	# 主程序
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/athena-led $(1)/usr/bin/
 
-	# 2. 物理按键探测脚本 (去掉 .sh 后缀，提升命令逼格)
+	# 物理按键探测脚本
 	$(INSTALL_BIN) ./files/find_button.sh $(1)/usr/bin/find_button
 
-	# 3. init.d 守护脚本
+	# init.d 守护脚本
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/athena_led.init $(1)/etc/init.d/athena_led
 
-	# 4. UCI 配置文件
+	# UCI 配置文件
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/athena_led.config $(1)/etc/config/athena_led
 
-	# 5. 预置动画 (.bin)
+	# 预置动画
 	$(INSTALL_DIR) $(1)/etc/athena_led/anim
 	$(CP) ./files/anim/*.bin $(1)/etc/athena_led/anim/ 2>/dev/null || true
 endef
@@ -72,7 +68,6 @@ endef
 define Package/$(PKG_NAME)/postinst
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
-	# apk / opkg 升级时的配置文件接管 (沿用旧版逻辑)
 	if [ -f /etc/config/athena_led.apk-new ]; then
 		mv /etc/config/athena_led /etc/config/athena_led.v1_bak 2>/dev/null
 		mv /etc/config/athena_led.apk-new /etc/config/athena_led
