@@ -1,0 +1,246 @@
+name: Buildapk2.5.0 Chain (Binary + IPK + APK)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 🟢 第一阶段：编译 Rust 核心二进制
+  build_rust:
+    name: 1. Build Rust Core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # 1. 读取版本号
+      - name: Get Version
+        id: version
+        run: |
+          MAKEFILE_PATH="athena-led/Makefile"
+
+          if [ ! -f "$MAKEFILE_PATH" ]; then
+            echo "⚠️ $MAKEFILE_PATH not found, using default version 1.0.0"
+            PKG_VERSION="1.0.0"
+          else
+            PKG_VERSION=$(grep "PKG_VERSION:=" "$MAKEFILE_PATH" | cut -d"=" -f2 | tr -d '[:space:]')
+            echo "✅ Found version $PKG_VERSION in $MAKEFILE_PATH"
+          fi
+
+          echo "VERSION=$PKG_VERSION" >> $GITHUB_OUTPUT
+
+      # 2. 准备 Rust 环境
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      # 3. 安装 Zig
+      - name: Install Zig & Zigbuild
+        run: |
+          pip3 install cargo-zigbuild ziglang
+
+      # 4. 编译 Rust
+      - name: Compile Rust
+        working-directory: ./athena-led
+        run: |
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
+
+      # 5. 打包二进制
+      - name: Package Binary
+        id: package
+        working-directory: ./athena-led
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          FILENAME="athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz"
+
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/athena-led dist/
+
+          cd dist
+          tar -czvf ../$FILENAME athena-led
+          cd ..
+
+          sha256sum $FILENAME > $FILENAME.sha256
+          cat $FILENAME.sha256
+
+          echo "ASSET_NAME=$FILENAME" >> $GITHUB_OUTPUT
+          echo "✅ Packed binary: $FILENAME"
+
+      # 6. 上传 Rust 二进制到 Release
+      - name: Upload Rust Binary to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            athena-led/*.tar.gz
+            athena-led/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 7. 传递给 OpenWrt 任务
+      - name: Pass Artifact to Next Job
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-binary-tarball
+          path: athena-led/*.tar.gz
+          retention-days: 1
+
+  # 🔵 第二阶段：编译 OpenWrt 安装包
+  build_openwrt:
+    name: 2. Build ${{ matrix.type }}
+    needs: build_rust
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - type: ipk
+            name: Stable (23.05)
+            sdk_url: "https://downloads.openwrt.org/releases/23.05.5/targets/ipq807x/generic"
+            use_apk: false
+          - type: apk
+            name: Snapshot (Qualcommax)
+            sdk_url: "https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx"
+            use_apk: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Rust Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-binary-tarball
+          path: local_dl/
+
+      - name: Prepare SDK
+        run: |
+          sudo apt-get update && sudo apt-get install -y zstd xz-utils
+
+          BASE_URL="${{ matrix.sdk_url }}"
+          echo "🔍 Fetching SDK list from $BASE_URL ..."
+          wget -qO- "$BASE_URL/sha256sums" > sha256sums.txt || { echo "❌ Failed to download sha256sums"; exit 1; }
+          cat sha256sums.txt | grep "sdk" | grep "Linux-x86_64" | head -n 5
+
+          SDK_FILE=$(grep "sdk" sha256sums.txt | grep "Linux-x86_64" | head -n 1 | awk '{print $2}' | sed 's/*//g')
+          if [ -z "$SDK_FILE" ]; then
+            echo "❌ SDK file not found in sha256sums"
+            echo "--- sha256sums contents (sdk related) ---"
+            grep -i sdk sha256sums.txt || echo "(no sdk entries found)"
+            echo "--- trying broader search ---"
+            grep -i "Linux-x86_64" sha256sums.txt | head -n 5 || true
+            exit 1
+          fi
+
+          echo "📦 Downloading SDK: $SDK_FILE"
+          wget -q "$BASE_URL/$SDK_FILE" || { echo "❌ Failed to download $SDK_FILE"; exit 1; }
+
+          # 兼容 .tar.xz (23.05 stable) 和 .tar.zst (snapshot)
+          if [[ "$SDK_FILE" == *.zst ]]; then
+            echo "📂 Extracting .zst archive..."
+            zstd -d "$SDK_FILE" -o sdk.tar
+            tar -xf sdk.tar
+            rm -f sdk.tar
+          elif [[ "$SDK_FILE" == *.xz ]]; then
+            echo "📂 Extracting .xz archive..."
+            tar -xf "$SDK_FILE"
+          else
+            echo "❌ Unknown archive format: $SDK_FILE"
+            exit 1
+          fi
+
+          EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n 1)
+          if [ -z "$EXTRACTED_DIR" ]; then
+            echo "❌ Extracted SDK directory not found"
+            ls -la
+            exit 1
+          fi
+
+          echo "📁 SDK directory: $EXTRACTED_DIR"
+          mv "$EXTRACTED_DIR" sdk
+
+      - name: Inject Source into SDK
+        run: |
+          mkdir -p sdk/dl
+          cp local_dl/*.tar.gz sdk/dl/
+
+      - name: Configure Feeds
+        working-directory: ./sdk
+        run: |
+          # 将 git.openwrt.org 替换为 github.com 镜像
+          sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf.default
+          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' feeds.conf.default
+          sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' feeds.conf.default
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Compile Packages
+        working-directory: ./sdk
+        run: |
+          sudo apt-get install -y dos2unix
+
+          # 修补 Makefile 兼容新 OpenWrt
+          find "$GITHUB_WORKSPACE" -name "Makefile" -path "*/athena-led*" | while read f; do
+            echo ">> patch $f"
+            sed -i \
+              -e 's/PKG_HASH:=.*/PKG_HASH:=none/' \
+              -e '/PKG_SOURCE_URL:=/d' \
+              "$f"
+          done
+
+          # 1. athena-led 核心包
+          mkdir -p package/athena-led
+          cp "$GITHUB_WORKSPACE/athena-led/Makefile" package/athena-led/
+          cp -r "$GITHUB_WORKSPACE/athena-led/files" package/athena-led/
+
+          # 2. luci-app 界面包
+          mkdir -p package/luci-app-athena-led
+          cp -r "$GITHUB_WORKSPACE/luci-app-athena-led"/* package/luci-app-athena-led/
+
+          # 3. 转 Linux 换行符
+          find package/athena-led package/luci-app-athena-led -type f ! -name "*.bin" -exec dos2unix {} +
+
+          # 4. 配置编译
+          echo "CONFIG_PACKAGE_athena-led=m" > .config
+          echo "CONFIG_PACKAGE_luci-app-athena-led=m" >> .config
+
+          make defconfig
+
+          make package/athena-led/compile V=s -j$(nproc)
+          make package/luci-app-athena-led/compile V=s -j$(nproc)
+
+      # 生成校验和
+      - name: Generate checksums
+        run: |
+          cd sdk/bin
+          find . -name "*athena-led*.${{ matrix.type }}" | while read f; do
+            sha256sum "$f"
+          done | sed 's# \./.*/# #' > sha256sums-${{ matrix.type }}.txt
+          cat sha256sums-${{ matrix.type }}.txt
+
+      # 上传到 Release
+      - name: Upload Packages to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sdk/bin/**/*athena-led*.${{ matrix.type }}
+            sdk/bin/sha256sums-${{ matrix.type }}.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 手动触发时上传 artifact
+      - name: Upload Packages as Artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: athena-led-${{ matrix.type }}-aarch64
+          path: |
+            sdk/bin/**/*athena-led*.${{ matrix.type }}
+            sdk/bin/sha256sums-${{ matrix.type }}.txt
+          retention-days: 7
